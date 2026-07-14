@@ -367,9 +367,16 @@ module.exports = {
         }
 
         if (sub === 'login') {
-            const phone = (args[1] || '').replace(/[^\d]/g, '');
-            if (!phone || phone.length < 10) {
-                return reply(`⚠️ Usage: \`${config.prefix}jazzdrive login 923001234567\``);
+            const rawPhone = (args[1] || '').replace(/[^\d]/g, '');
+            if (!rawPhone || rawPhone.length < 10) {
+                return reply(`⚠️ Usage: \`${config.prefix}jazzdrive login 03247220362\` (or \`923247220362\`)`);
+            }
+            let phone;
+            try { phone = normalizePkPhone(rawPhone); } catch (e) {
+                return reply(`⚠️ ${e.message}`);
+            }
+            if (!/^03\d{9}$/.test(phone)) {
+                return reply(`⚠️ Invalid Pakistan number. Expected 11-digit format like \`03247220362\`.`);
             }
             if (activeDrivers.has(sender)) {
                 return reply('⏳ A login is already pending. Send the OTP or run `.jazzdrive logout` to reset.');
