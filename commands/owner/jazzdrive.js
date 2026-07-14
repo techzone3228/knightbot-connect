@@ -108,6 +108,71 @@ async function isLoggedIn(driver) {
     } catch (_) { return false; }
 }
 
+async function setPhoneValue(driver, phone) {
+    return driver.executeScript(function (value) {
+        const selectors = [
+            '#signinform2 #msisdn2',
+            '#msisdn2',
+            'form[id*="signin" i] input[type="tel"]',
+            'form[id*="login" i] input[type="tel"]',
+            'input[id*="msisdn" i]',
+            'input[name*="msisdn" i]',
+            'input[type="tel"]',
+            'input[placeholder*="phone" i]',
+            'input[placeholder*="mobile" i]',
+            'input[placeholder*="number" i]'
+        ];
+        const seen = new Set();
+        const isVisible = (el) => {
+            if (!el || seen.has(el)) return false;
+            seen.add(el);
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 && !el.disabled && !el.readOnly;
+        };
+        const candidates = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+        const input = candidates.find(isVisible) || candidates[0];
+        if (!input) return { ok: false, reason: 'phone_input_not_found' };
+
+        input.scrollIntoView({ block: 'center', inline: 'center' });
+        input.focus();
+        const proto = Object.getPrototypeOf(input);
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(input, value);
+        else input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: value[value.length - 1] || '0' }));
+        window.__jazzDriveLastPhoneInput = input;
+        return { ok: true, id: input.id || '', name: input.name || '', type: input.type || '', value: input.value };
+    }, phone);
+}
+
+async function clickLoginButton(driver) {
+    return driver.executeScript(function () {
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 && !el.disabled;
+        };
+        const input = window.__jazzDriveLastPhoneInput;
+        const form = input?.closest?.('form');
+        const scoped = form ? Array.from(form.querySelectorAll('button, input[type="submit"], a')) : [];
+        const all = Array.from(document.querySelectorAll('#signinform2 #signinbtn, #signinform2 button, button, input[type="submit"], a'));
+        const candidates = [...scoped, ...all];
+        const button = candidates.find((el) => {
+            if (!isVisible(el)) return false;
+            const text = `${el.innerText || ''} ${el.value || ''} ${el.id || ''} ${el.className || ''}`.toLowerCase();
+            return /login|log in|sign in|signin|continue|next|submit/.test(text);
+        }) || candidates.find(isVisible);
+        if (!button) return { ok: false, reason: 'login_button_not_found' };
+        button.scrollIntoView({ block: 'center', inline: 'center' });
+        button.click();
+        return { ok: true, id: button.id || '', text: (button.innerText || button.value || '').trim() };
+    });
+}
+
 // ----------- login steps -----------
 function normalizePkPhone(input) {
     let d = (input || '').replace(/\D/g, '');
@@ -125,31 +190,43 @@ async function submitPhone(driver, phone) {
     if (!/^03\d{9}$/.test(local)) {
         throw new Error(`Invalid Pakistan mobile number after normalization: ${local}`);
     }
-    // JazzDrive page has TWO forms: #signinform (Sign Up, #msisdn) and
-    // #signinform2 (Login, #msisdn2). We MUST use the login form.
-    const phoneInput = await driver.wait(until.elementLocated(By.id('msisdn2')), 20000);
-    await phoneInput.clear();
-    await phoneInput.sendKeys(local);
-    // Click the Login button (scoped inside #signinform2 to avoid the Subscribe btn)
-    const loginBtn = await driver.wait(
-        until.elementLocated(By.css('#signinform2 #signinbtn, #signinform2 button')),
-        20000
-    );
-    await driver.wait(until.elementIsEnabled(loginBtn), 10000);
-    try { await loginBtn.click(); } catch (_) {
-        await driver.executeScript('arguments[0].click();', loginBtn);
+    // JazzDrive often renders hidden duplicate inputs/forms. Selenium's clear/sendKeys
+    // throws "element not interactable" on those, so set the visible input through
+    // the DOM and dispatch real input/change events for the SPA listeners.
+    await driver.wait(async () => {
+        const result = await setPhoneValue(driver, local);
+        return result && result.ok;
+    }, 30000, 'JazzDrive phone input not found/interactable');
+
+    const clicked = await clickLoginButton(driver);
+    if (!clicked || !clicked.ok) {
+        // Last fallback: pressing Enter on the active phone field submits many builds.
+        await driver.actions().sendKeys(Key.ENTER).perform();
     }
-    await driver.sleep(5000);
+    await driver.sleep(7000);
     // On success the page moves to the OTP entry view
     const url = (await driver.getCurrentUrl()).toLowerCase();
-    const otpProbe = await driver.findElements(
-        By.xpath("//input[@type='tel' or @type='text' or @type='number']")
-    );
     // On the initial login page the two visible inputs are #msisdn and #msisdn2.
     // OTP screen has different inputs (short maxlength or a single otp field), and
     // #msisdn2 is no longer present.
-    const stillOnLogin = await driver.findElements(By.id('msisdn2'));
-    return stillOnLogin.length === 0 || url.includes('otp') || url.includes('verify') || url.includes('pin');
+    const stillOnLogin = await driver.executeScript(function () {
+        const inputs = Array.from(document.querySelectorAll('#msisdn2, input[id*="msisdn" i], input[name*="msisdn" i]'));
+        return inputs.some((el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+        });
+    });
+    const otpVisible = await driver.executeScript(function () {
+        const inputs = Array.from(document.querySelectorAll('input[type="tel"], input[type="text"], input[type="number"]'));
+        return inputs.some((el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            const hint = `${el.id || ''} ${el.name || ''} ${el.placeholder || ''} ${el.autocomplete || ''}`.toLowerCase();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 && (/otp|pin|code|verify/.test(hint) || Number(el.maxLength) <= 6);
+        });
+    });
+    return !stillOnLogin || otpVisible || url.includes('otp') || url.includes('verify') || url.includes('pin');
 }
 
 async function submitOtp(driver, otp) {
