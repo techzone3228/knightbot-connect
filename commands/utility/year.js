@@ -193,18 +193,36 @@ module.exports = {
 
     async handleSession(sock, msg, session, context) {
         const { from, sender, reply, isButtonClick } = context;
-        const text = (msg.message?.conversation ||
-                      msg.message?.extendedTextMessage?.text || '').trim();
+        let text = (msg.message?.conversation ||
+                    msg.message?.extendedTextMessage?.text || '').trim();
+        let buttonId = '';
 
-        // Button click handling
+        // Extract button id/text for button clicks
         if (isButtonClick) {
-            const lower = text.toLowerCase();
-            if (lower.includes('cancel') || lower.includes('done') || lower.includes('close')) {
+            if (msg.message?.buttonsResponseMessage) {
+                buttonId = msg.message.buttonsResponseMessage.selectedButtonId || '';
+                text = msg.message.buttonsResponseMessage.selectedDisplayText || text;
+            } else if (msg.message?.templateButtonReplyMessage) {
+                buttonId = msg.message.templateButtonReplyMessage.selectedId || '';
+                text = msg.message.templateButtonReplyMessage.selectedDisplayText || text;
+            } else if (msg.message?.interactiveResponseMessage?.nativeFlowResponseMessage) {
+                try {
+                    const params = JSON.parse(msg.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson);
+                    buttonId = params.id || '';
+                    text = params.display_text || text;
+                } catch (_) {}
+            } else if (msg.message?.listResponseMessage?.singleSelectReply) {
+                buttonId = msg.message.listResponseMessage.singleSelectReply.selectedRowId || '';
+                text = msg.message.listResponseMessage.title || text;
+            }
+
+            const key = `${buttonId} ${text}`.toLowerCase();
+            if (key.includes('cancel') || key.includes('done') || key.includes('close')) {
                 sessionManager.clearSession(session.id);
                 await reply('✅ Age calculator closed.');
                 return true;
             }
-            if (lower.includes('again') || lower.includes('calculate')) {
+            if (key.includes('again') || key.includes('calculate')) {
                 sessionManager.clearSession(session.id);
                 sessionManager.createSession(sender, from, this.name, { step: 1 });
                 const sentMsg = await askBirthDate(sock, from, msg, reply);
