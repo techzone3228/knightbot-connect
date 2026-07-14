@@ -1,107 +1,70 @@
 /**
- * AutoReply Manager - Manage automatic replies for specific commands with button support
- * Each button can have its own unique reply
+ * AutoReply Manager - Simple text auto-replies for specific triggers.
+ * Owner sets a trigger with `.autoreply <trigger>` and then sends the
+ * reply as a separate follow-up message. Rules persist to Google Drive.
  */
 
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const config = require('../../config');
 const sessionManager = require('../../utils/sessionManager');
-const giftedBtns = require('gifted-btns');
-const { sendButtons, sendInteractiveMessage } = giftedBtns;
-
-// Force AI mode ON for gifted buttons
-const FORCE_AI_MODE = true;
 
 // Google Drive Configuration
 const AUTOREPLY_FILE_ID = '14vVikOWDqrt1fghgs5REWH4BWX6upUVD';
 const TOKEN_URL = "https://drive.usercontent.google.com/download?id=1NZ3NvyVBnK85S8f5eTZJS5uM5c59xvGM&export=download";
 const UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-const FILE_URL = "https://www.googleapis.com/drive/v3/files";
 
 let cachedToken = null;
 let tokenExpiry = null;
 
-// Store autoreply rules in memory
+// Store autoreply rules in memory: Map<trigger, { text }>
 let autoreplyRules = new Map();
 
-// Store button handlers for auto-reply buttons (keep them alive)
-const buttonHandlers = new Map();
+// Reserved sub-commands (cannot be used as triggers)
+const RESERVED = new Set(['list', 'add', 'remove', 'delete', 'update', 'reload', 'help', 'cancel']);
 
-// Helper function to parse escape sequences
-function parseEscapeSequences(str) {
-    if (!str) return str;
-    return str.replace(/\\n/g, '\n')
-              .replace(/\\t/g, '\t')
-              .replace(/\\r/g, '\r')
-              .replace(/\\\\/g, '\\');
-}
-
-// Default rules with buttons and their replies
-const DEFAULT_RULES = {
-    "Need-Help": {
-        text: "🆘 *Help Menu*\n\nWhat do you need help with?",
-        buttons: [
-            { id: "help_gemini", text: "🤖 Gemini AI", reply: "🤖 *Gemini AI Help*\n\n• `.gemini <question>` - Ask a question\n• Reply to media with `.gemini` - Analyze media\n• `.gemini <q> --file <url>` - Analyze file URL" },
-            { id: "help_media", text: "🎬 Media Downloaders", reply: "🎬 *Media Downloaders*\n\n• `.ytvideo <url>` - YouTube video\n• `.song <url>` - YouTube audio\n• `.instagram <url>` - Instagram\n• `.tiktok <url>` - TikTok\n• `.facebook <url>` - Facebook" },
-            { id: "help_commands", text: "📋 All Commands", reply: "📋 *All Commands*\n\nUse `.menu` to see all available commands.\nUse `.list` for detailed command list." },
-            { id: "help_channel", text: "📢 Join Channel", reply: "📢 *Join Our Channel*\n\nhttps://whatsapp.com/channel/0029Va90zAnIHphOuO8Msp3A\n\nGet updates, new features, and announcements!" }
-        ]
-    }
-};
-
-// ==================== GOOGLE DRIVE FUNCTIONS ====================
+// ==================== GOOGLE DRIVE ====================
 
 async function getAccessToken() {
     try {
-        if (cachedToken && tokenExpiry && new Date() < tokenExpiry) {
-            return cachedToken;
-        }
-        
-        console.log('[AUTOREPLY] Fetching Google Drive token...');
-        
+        if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
+
         const tokenResponse = await axios({
             method: 'GET',
             url: TOKEN_URL,
             responseType: 'stream',
             timeout: 30000
         });
-        
+
         const tempTokenFile = path.join(process.cwd(), 'temp', `token_${Date.now()}.json`);
         const tokenDir = path.dirname(tempTokenFile);
         if (!fs.existsSync(tokenDir)) fs.mkdirSync(tokenDir, { recursive: true });
-        
+
         const tokenWriter = fs.createWriteStream(tempTokenFile);
         tokenResponse.data.pipe(tokenWriter);
-        
         await new Promise((resolve, reject) => {
             tokenWriter.on('finish', resolve);
             tokenWriter.on('error', reject);
         });
-        
+
         const tokenData = JSON.parse(fs.readFileSync(tempTokenFile, 'utf8'));
         fs.unlinkSync(tempTokenFile);
-        
+
         const expiryDate = new Date(tokenData.expiry);
         if (new Date() > expiryDate) {
-            console.log('[AUTOREPLY] Token expired, refreshing...');
-            const refreshData = {
+            const refreshResponse = await axios.post(tokenData.token_uri, {
                 client_id: tokenData.client_id,
                 client_secret: tokenData.client_secret,
                 refresh_token: tokenData.refresh_token,
                 grant_type: 'refresh_token'
-            };
-            const refreshResponse = await axios.post(tokenData.token_uri, refreshData);
+            });
             cachedToken = refreshResponse.data.access_token;
             tokenExpiry = new Date(Date.now() + 3600 * 1000);
         } else {
             cachedToken = tokenData.token;
             tokenExpiry = new Date(expiryDate);
         }
-        
         return cachedToken;
-        
     } catch (error) {
         console.error('[AUTOREPLY] Failed to get token:', error.message);
         return null;
@@ -109,97 +72,48 @@ async function getAccessToken() {
 }
 
 function rulesToText(rules) {
-    let text = '# KnightBot-Mini AutoReply Rules\n';
-    text += '# Format: COMMAND | TEXT | BUTTONS\n';
-    text += '# Buttons format: id:text:reply,id:text:reply\n';
-    text += '# Use \\n for new lines in replies\n';
-    text += '# Example: Need-Help | Help message | help1:🤖 Option 1:This is reply 1,help2:🎬 Option 2:This is reply 2\n';
-    text += `# Last updated: ${new Date().toLocaleString()}\n\n`;
-    
-    for (const [command, rule] of rules) {
-        let line = `${command} | ${rule.text.replace(/\n/g, '\\n')}`;
-        if (rule.buttons && rule.buttons.length > 0) {
-            const buttonsStr = rule.buttons.map(b => `${b.id}:${b.text}:${b.reply.replace(/\n/g, '\\n')}`).join(',');
-            line += ` | ${buttonsStr}`;
-        }
-        text += line + '\n';
+    let out = '# KnightBot-Mini AutoReply Rules\n';
+    out += '# Format: TRIGGER | TEXT (newlines are encoded as \\n)\n';
+    out += `# Last updated: ${new Date().toLocaleString()}\n\n`;
+    for (const [trigger, rule] of rules) {
+        out += `${trigger} | ${(rule.text || '').replace(/\r?\n/g, '\\n')}\n`;
     }
-    
-    return text;
+    return out;
 }
 
 function textToRules(text) {
     const rules = new Map();
-    const lines = text.split('\n');
-    
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        
-        const parts = trimmed.split('|').map(p => p.trim());
-        if (parts.length >= 2) {
-            const command = parts[0];
-            let replyText = parseEscapeSequences(parts[1]);
-            let buttons = [];
-            
-            if (parts.length >= 3 && parts[2]) {
-                const buttonParts = parts[2].split(',');
-                for (const btn of buttonParts) {
-                    const btnParts = btn.split(':');
-                    if (btnParts.length >= 3) {
-                        const id = btnParts[0];
-                        const text = btnParts[1];
-                        const reply = parseEscapeSequences(btnParts.slice(2).join(':'));
-                        if (id && text && reply) {
-                            buttons.push({ id, text, reply });
-                        }
-                    }
-                }
-            }
-            
-            if (command && replyText) {
-                rules.set(command, { text: replyText, buttons });
-            }
-        }
+    for (const raw of text.split('\n')) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        // Split into at most 3 parts to stay compatible with the old
+        // "TRIGGER | TEXT | BUTTONS" format; ignore any buttons column.
+        const parts = line.split('|').map(p => p.trim());
+        if (parts.length < 2) continue;
+        const trigger = parts[0];
+        const body = parts[1].replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+        if (trigger && body) rules.set(trigger, { text: body });
     }
-    
     return rules;
 }
 
 async function readRulesFromDrive() {
     try {
         const token = await getAccessToken();
-        if (!token) return DEFAULT_RULES;
-        
-        console.log('[AUTOREPLY] Reading rules from Google Drive...');
-        
-        try {
-            const response = await axios({
-                method: 'GET',
-                url: `https://www.googleapis.com/drive/v3/files/${AUTOREPLY_FILE_ID}?alt=media`,
-                headers: { 'Authorization': `Bearer ${token}` },
-                responseType: 'text',
-                timeout: 30000
-            });
-            
-            const rules = textToRules(response.data);
-            if (rules.size > 0) {
-                console.log(`[AUTOREPLY] Loaded ${rules.size} rules from Drive`);
-                return rules;
-            }
-        } catch (error) {
-            if (error.response?.status === 404) {
-                console.log('[AUTOREPLY] File not found, creating new with defaults');
-            } else {
-                console.error('[AUTOREPLY] Failed to read:', error.message);
-            }
-        }
-        
-        return new Map(Object.entries(DEFAULT_RULES));
-        
+        if (!token) return new Map();
+        const response = await axios({
+            method: 'GET',
+            url: `https://www.googleapis.com/drive/v3/files/${AUTOREPLY_FILE_ID}?alt=media`,
+            headers: { 'Authorization': `Bearer ${token}` },
+            responseType: 'text',
+            timeout: 30000
+        });
+        return textToRules(response.data);
     } catch (error) {
-        console.error('[AUTOREPLY] Error reading rules:', error.message);
-        return new Map(Object.entries(DEFAULT_RULES));
+        if (error.response?.status !== 404) {
+            console.error('[AUTOREPLY] Failed to read:', error.message);
+        }
+        return new Map();
     }
 }
 
@@ -207,31 +121,28 @@ async function writeRulesToDrive(rules) {
     try {
         const token = await getAccessToken();
         if (!token) return false;
-        
-        console.log('[AUTOREPLY] Saving rules to Google Drive...');
-        
-        const textContent = rulesToText(rules);
-        const fileBuffer = Buffer.from(textContent, 'utf8');
-        
+        const fileBuffer = Buffer.from(rulesToText(rules), 'utf8');
+
         let fileExists = false;
         try {
             await axios.get(`https://www.googleapis.com/drive/v3/files/${AUTOREPLY_FILE_ID}`, {
                 headers: { 'Authorization': `Bearer ${token}` }
             });
             fileExists = true;
-        } catch (e) {
-            fileExists = false;
-        }
-        
+        } catch (_) { fileExists = false; }
+
         if (fileExists) {
-            const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${AUTOREPLY_FILE_ID}?uploadType=media`;
-            await axios.patch(updateUrl, fileBuffer, {
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'text/plain',
-                    'Content-Length': fileBuffer.length
+            await axios.patch(
+                `https://www.googleapis.com/upload/drive/v3/files/${AUTOREPLY_FILE_ID}?uploadType=media`,
+                fileBuffer,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'text/plain',
+                        'Content-Length': fileBuffer.length
+                    }
                 }
-            });
+            );
         } else {
             const FormData = require('form-data');
             const formData = new FormData();
@@ -244,18 +155,11 @@ async function writeRulesToDrive(rules) {
                 filename: 'autoreply_rules.txt',
                 contentType: 'text/plain'
             });
-            
             await axios.post(UPLOAD_URL, formData, {
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    ...formData.getHeaders()
-                }
+                headers: { 'Authorization': `Bearer ${token}`, ...formData.getHeaders() }
             });
         }
-        
-        console.log('[AUTOREPLY] Rules saved to Drive');
         return true;
-        
     } catch (error) {
         console.error('[AUTOREPLY] Failed to save:', error.message);
         return false;
@@ -263,339 +167,191 @@ async function writeRulesToDrive(rules) {
 }
 
 async function loadRules() {
-    const rules = await readRulesFromDrive();
-    autoreplyRules = rules;
-    return rules;
+    autoreplyRules = await readRulesFromDrive();
+    console.log(`[AUTOREPLY] Loaded ${autoreplyRules.size} rules`);
+    return autoreplyRules;
 }
 
 async function saveRules() {
     return await writeRulesToDrive(autoreplyRules);
 }
 
-async function addRule(command, text, buttons = []) {
-    autoreplyRules.set(command, { text, buttons });
-    return await saveRules();
-}
-
-async function removeRule(command) {
-    const deleted = autoreplyRules.delete(command);
-    if (deleted) await saveRules();
-    return deleted;
-}
-
-async function updateRule(command, text, buttons = null) {
-    const existing = autoreplyRules.get(command);
-    if (existing) {
-        autoreplyRules.set(command, {
-            text: text || existing.text,
-            buttons: buttons !== null ? buttons : existing.buttons
-        });
-        return await saveRules();
-    }
-    return false;
-}
-
-async function getRule(command) {
-    return autoreplyRules.get(command);
-}
-
-async function getAllRules() {
-    return Array.from(autoreplyRules.entries()).map(([cmd, rule]) => ({ 
-        command: cmd, 
-        text: rule.text,
-        buttons: rule.buttons || []
-    }));
-}
+// ==================== RUNTIME MATCHER ====================
 
 async function checkAndReply(sock, from, sender, message, reply) {
-    const trimmedMsg = message.trim();
-    if (autoreplyRules.has(trimmedMsg)) {
-        const rule = autoreplyRules.get(trimmedMsg);
-        
-        if (rule.buttons && rule.buttons.length > 0) {
-            // Send with buttons - use simple timestamp as session ID
-            const sessionId = Date.now().toString();
-            const buttons = rule.buttons.map((btn, idx) => ({
-                id: `autoreply_${sessionId}_${idx}`,
-                text: btn.text
-            }));
-            
-            const sentMsg = await sendButtons(sock, from, {
-                text: rule.text,
-                footer: 'Auto Reply',
-                buttons: buttons,
-                aimode: FORCE_AI_MODE
-            }, {});
-            
-            // Store button handlers with their replies
-            buttonHandlers.set(sessionId, {
-                command: trimmedMsg,
-                buttons: rule.buttons,
-                originalMessageId: sentMsg.key.id,
-                timestamp: Date.now(),
-                sessionId: sessionId
-            });
-            
-            console.log(`[AUTOREPLY] Stored handler for session: ${sessionId} with ${rule.buttons.length} buttons`);
-            
-            // Clean up old handlers after 30 minutes
-            setTimeout(() => {
-                buttonHandlers.delete(sessionId);
-                console.log(`[AUTOREPLY] Cleaned up handler for session: ${sessionId}`);
-            }, 30 * 60 * 1000);
-            
-        } else {
-            // Send as plain text
-            await reply(rule.text);
-        }
-        
-        console.log(`[AUTOREPLY] Replied to "${trimmedMsg}" from ${sender} ${rule.buttons.length > 0 ? '(with buttons)' : ''}`);
-        return true;
-    }
-    return false;
+    const trimmed = (message || '').trim();
+    if (!trimmed) return false;
+    const rule = autoreplyRules.get(trimmed);
+    if (!rule) return false;
+    await reply(rule.text);
+    console.log(`[AUTOREPLY] Replied to "${trimmed}" from ${sender}`);
+    return true;
 }
 
-async function handleButtonClick(sock, msg, buttonId, buttonText, from, sender, reply) {
-    console.log(`[AUTOREPLY] Handling button click: ${buttonId}, Text: ${buttonText}`);
-    
-    // Extract session ID and button index from button ID
-    // Format: autoreply_<sessionId>_<index>
-    const parts = buttonId.split('_');
-    if (parts.length >= 3 && parts[0] === 'autoreply') {
-        // The session ID is everything between the first and last underscore
-        const buttonIndex = parseInt(parts[parts.length - 1]);
-        const sessionId = parts.slice(1, -1).join('_');
-        
-        console.log(`[AUTOREPLY] Extracted sessionId: ${sessionId}, buttonIndex: ${buttonIndex}`);
-        
-        // Find handler by session ID
-        const handler = buttonHandlers.get(sessionId);
-        
-        if (handler && handler.buttons && handler.buttons[buttonIndex]) {
-            const button = handler.buttons[buttonIndex];
-            console.log(`[AUTOREPLY] Button clicked: ${button.id} - ${button.text}`);
-            
-            // Send the button's specific reply
-            if (button.reply) {
-                await reply(button.reply);
-                console.log(`[AUTOREPLY] Sent reply for button: ${button.id}`);
-            } else {
-                await reply(`📌 *${button.text}*\n\nYou selected: ${button.text}\n\nNo reply configured for this button.`);
-                console.log(`[AUTOREPLY] No reply configured for button: ${button.id}`);
-            }
-            
-            return true;
-        } else {
-            console.log(`[AUTOREPLY] Handler not found for sessionId: ${sessionId}`);
-            console.log(`[AUTOREPLY] Available handlers: ${Array.from(buttonHandlers.keys()).join(', ')}`);
-        }
-    }
-    
-    console.log(`[AUTOREPLY] No handler found for button: ${buttonId}`);
-    return false;
+async function checkAutoReply(sock, from, sender, message, reply) {
+    if (!from) return false;
+    if (from.endsWith('@g.us')) return false;
+    if (from.includes('@broadcast')) return false;
+    if (from.includes('@newsletter')) return false;
+    return await checkAndReply(sock, from, sender, message, reply);
+}
+
+// Buttons are no longer used — keep the export as a no-op for handler compat.
+async function handleAutoReplyButton() { return false; }
+
+// ==================== COMMAND ====================
+
+// Extract plain text from an incoming message (ignores button/interactive payloads)
+function extractPlainText(msg) {
+    if (!msg || !msg.message) return '';
+    return (
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        msg.message.videoMessage?.caption ||
+        ''
+    ).trim();
 }
 
 module.exports = {
     name: 'autoreply',
     aliases: ['ar', 'autorespond', 'autor'],
-    description: 'Manage automatic replies for specific commands',
-    usage: '.autoreply <list|add|remove|update|reload|help>',
+    description: 'Manage automatic replies for specific triggers',
+    usage: '.autoreply <trigger> | list | remove <trigger> | reload | help',
     category: 'owner',
     ownerOnly: true,
 
     async execute(sock, msg, args, context) {
         const { from, sender, reply, react } = context;
-        
+
         if (args.length === 0) {
-            return reply(`🤖 *AutoReply Manager*\n\n` +
-                       `*Rules Count:* ${autoreplyRules.size}\n\n` +
-                       `*Commands:*\n` +
-                       `• \`.autoreply list\` - Show all rules\n` +
-                       `• \`.autoreply add <command> | <text> | <buttons>\` - Add rule\n` +
-                       `• \`.autoreply remove <command>\` - Remove rule\n` +
-                       `• \`.autoreply update <command> | <text> | <buttons>\` - Update rule\n` +
-                       `• \`.autoreply reload\` - Reload from Drive\n` +
-                       `• \`.autoreply help\` - Show help\n\n` +
-                       `*Button Format:*\n` +
-                       `id:text:reply,id:text:reply\n` +
-                       `*Example:*\n` +
-                       `.autoreply add Shop-Menu | 🛒 *Shop Menu*\\n\\nWhat would you like? | buy1:📱 iPhone:iPhone 15 - $999\\n\\nClick .buy,btn2:💻 MacBook:MacBook Pro - $1999\\n\\nClick .buy`);
+            return reply(
+                `🤖 *AutoReply Manager*\n\n` +
+                `*Rules:* ${autoreplyRules.size}\n\n` +
+                `*Usage:*\n` +
+                `• \`.autoreply <trigger>\` — set/update reply for a trigger\n` +
+                `• \`.autoreply list\` — show all rules\n` +
+                `• \`.autoreply remove <trigger>\` — delete a rule\n` +
+                `• \`.autoreply reload\` — reload from Drive\n` +
+                `• \`.autoreply help\` — show help`
+            );
         }
-        
-        const subCommand = args[0].toLowerCase();
-        
-        if (subCommand === 'list') {
-            const rules = await getAllRules();
-            if (rules.length === 0) {
-                return reply('📭 No auto-reply rules configured.');
+
+        const sub = args[0].toLowerCase();
+
+        if (sub === 'list') {
+            if (autoreplyRules.size === 0) return reply('📭 No auto-reply rules configured.');
+            let out = `🤖 *AutoReply Rules* (${autoreplyRules.size})\n\n`;
+            let i = 1;
+            for (const [trigger, rule] of autoreplyRules) {
+                const preview = rule.text.length > 60 ? rule.text.slice(0, 60) + '…' : rule.text;
+                out += `${i++}. \`${trigger}\`\n   💬 ${preview.replace(/\n/g, ' ')}\n\n`;
+                if (i > 30) { out += `… and ${autoreplyRules.size - 30} more`; break; }
             }
-            
-            let listMsg = '🤖 *AutoReply Rules*\n\n';
-            for (let i = 0; i < Math.min(rules.length, 20); i++) {
-                const rule = rules[i];
-                const textPreview = rule.text.length > 50 ? rule.text.substring(0, 50) + '...' : rule.text;
-                listMsg += `${i + 1}. \`${rule.command}\`\n`;
-                listMsg += `   💬 ${textPreview}\n`;
-                if (rule.buttons && rule.buttons.length > 0) {
-                    listMsg += `   🔘 Buttons:\n`;
-                    for (const btn of rule.buttons) {
-                        const replyPreview = btn.reply.length > 40 ? btn.reply.substring(0, 40) + '...' : btn.reply;
-                        listMsg += `      • ${btn.text} → ${replyPreview}\n`;
-                    }
-                }
-                listMsg += `\n`;
-            }
-            
-            if (rules.length > 20) {
-                listMsg += `... and ${rules.length - 20} more rules`;
-            }
-            
-            return reply(listMsg);
+            return reply(out);
         }
-        
-        if (subCommand === 'add') {
-            if (args.length < 3) {
-                return reply('❌ Usage: .autoreply add <command> | <text> | <buttons>\n\nExample: .autoreply add Shop-Menu | 🛒 *Shop Menu*\\n\\nWhat would you like? | buy1:📱 iPhone:iPhone 15 - $999\\n\\nClick .buy,btn2:💻 MacBook:MacBook Pro - $1999\\n\\nClick .buy');
-            }
-            
-            const fullArgs = args.slice(1).join(' ');
-            const parts = fullArgs.split('|').map(p => p.trim());
-            
-            if (parts.length < 2) {
-                return reply('❌ Invalid format. Use: command | text | buttons');
-            }
-            
-            const command = parts[0];
-            let text = parts[1];
-            text = parseEscapeSequences(text);
-            let buttons = [];
-            
-            if (parts.length >= 3 && parts[2]) {
-                const buttonParts = parts[2].split(',');
-                for (const btn of buttonParts) {
-                    const btnParts = btn.split(':');
-                    if (btnParts.length >= 3) {
-                        const id = btnParts[0];
-                        const btnText = btnParts[1];
-                        let btnReply = btnParts.slice(2).join(':');
-                        btnReply = parseEscapeSequences(btnReply);
-                        buttons.push({ id, text: btnText, reply: btnReply });
-                    } else {
-                        return reply(`❌ Invalid button format: ${btn}\n\nUse: id:text:reply`);
-                    }
-                }
-            }
-            
-            await addRule(command, text, buttons);
-            await react('✅');
-            return reply(`✅ *Rule Added*\n\nCommand: \`${command}\`\nText: ${text.substring(0, 100)}${text.length > 100 ? '...' : ''}\nButtons: ${buttons.length}`);
+
+        if (sub === 'remove' || sub === 'delete') {
+            if (args.length < 2) return reply('❌ Usage: `.autoreply remove <trigger>`');
+            const trigger = args.slice(1).join(' ').trim();
+            if (!autoreplyRules.has(trigger)) return reply(`❌ Rule not found: \`${trigger}\``);
+            autoreplyRules.delete(trigger);
+            await saveRules();
+            await react('🗑️');
+            return reply(`✅ Removed rule: \`${trigger}\``);
         }
-        
-        if (subCommand === 'update') {
-            if (args.length < 3) {
-                return reply('❌ Usage: .autoreply update <command> | <text> | <buttons>');
-            }
-            
-            const fullArgs = args.slice(1).join(' ');
-            const parts = fullArgs.split('|').map(p => p.trim());
-            
-            if (parts.length < 2) {
-                return reply('❌ Invalid format. Use: command | text | buttons');
-            }
-            
-            const command = parts[0];
-            let text = parts[1];
-            text = parseEscapeSequences(text);
-            let buttons = [];
-            
-            if (parts.length >= 3 && parts[2]) {
-                const buttonParts = parts[2].split(',');
-                for (const btn of buttonParts) {
-                    const btnParts = btn.split(':');
-                    if (btnParts.length >= 3) {
-                        const id = btnParts[0];
-                        const btnText = btnParts[1];
-                        let btnReply = btnParts.slice(2).join(':');
-                        btnReply = parseEscapeSequences(btnReply);
-                        buttons.push({ id, text: btnText, reply: btnReply });
-                    } else {
-                        return reply(`❌ Invalid button format: ${btn}\n\nUse: id:text:reply`);
-                    }
-                }
-            }
-            
-            const updated = await updateRule(command, text, buttons);
-            if (updated) {
-                await react('🔄');
-                return reply(`✅ *Rule Updated*\n\nCommand: \`${command}\``);
-            } else {
-                return reply(`❌ Rule not found: \`${command}\``);
-            }
-        }
-        
-        if (subCommand === 'remove' || subCommand === 'delete') {
-            if (args.length < 2) {
-                return reply('❌ Usage: .autoreply remove <command>');
-            }
-            
-            const command = args[1];
-            const removed = await removeRule(command);
-            
-            if (removed) {
-                await react('🗑️');
-                return reply(`✅ *Rule Removed*\n\nCommand: \`${command}\``);
-            } else {
-                return reply(`❌ Rule not found: \`${command}\``);
-            }
-        }
-        
-        if (subCommand === 'reload') {
+
+        if (sub === 'reload') {
             await loadRules();
             await react('🔄');
-            return reply(`✅ *Rules Reloaded*\n\nLoaded ${autoreplyRules.size} rules from Google Drive.`);
+            return reply(`✅ Reloaded ${autoreplyRules.size} rules from Drive.`);
         }
-        
-        if (subCommand === 'help') {
-            return reply(`🤖 *AutoReply Manager - Help*\n\n` +
-                       `*Commands:*\n` +
-                       `• \`.autoreply list\` - List all rules\n` +
-                       `• \`.autoreply add <command> | <text> | <buttons>\` - Add new rule\n` +
-                       `• \`.autoreply update <command> | <text> | <buttons>\` - Update rule\n` +
-                       `• \`.autoreply remove <command>\` - Remove a rule\n` +
-                       `• \`.autoreply reload\` - Reload from Google Drive\n` +
-                       `• \`.autoreply help\` - Show this help\n\n` +
-                       `*Button Format:*\n` +
-                       `id:text:reply,id:text:reply\n\n` +
-                       `*Example:*\n` +
-                       `.autoreply add Need-Help | Choose an option | opt1:📱 Option 1:This is reply for option 1,opt2:🎬 Option 2:This is reply for option 2\n\n` +
-                       `*Note:* Use \\n for new lines in replies\n\n` +
-                       `*Storage:*\n` +
-                       `All rules are saved to Google Drive and persist across bot restarts.`);
+
+        if (sub === 'help') {
+            return reply(
+                `🤖 *AutoReply Help*\n\n` +
+                `*Set a reply:*\n` +
+                `1. Send \`.autoreply <trigger>\`\n` +
+                `2. Bot will ask for the reply message.\n` +
+                `3. Send the reply as a separate message — it will be saved *exactly* as sent (multi-line supported).\n\n` +
+                `*Other:*\n` +
+                `• \`.autoreply list\`\n` +
+                `• \`.autoreply remove <trigger>\`\n` +
+                `• \`.autoreply reload\`\n\n` +
+                `Send \`cancel\` during setup to abort.`
+            );
         }
-        
-        return reply(`❌ Unknown subcommand: ${subCommand}\n\nUse \`.autoreply help\` for available commands.`);
+
+        // Otherwise treat the entire args as a trigger name and start a
+        // session that waits for the reply message.
+        const trigger = args.join(' ').trim();
+        if (!trigger) return reply('❌ Please provide a trigger.');
+        if (RESERVED.has(trigger.toLowerCase())) {
+            return reply(`❌ \`${trigger}\` is a reserved word and cannot be used as a trigger.`);
+        }
+
+        const existing = autoreplyRules.get(trigger);
+        sessionManager.createSession(sender, from, this.name, { step: 1, trigger });
+
+        const prompt =
+            `📝 *AutoReply Setup*\n\n` +
+            `Trigger: \`${trigger}\`\n` +
+            (existing
+                ? `A rule already exists for this trigger. Sending a new message will *overwrite* it.\n\n`
+                : ``) +
+            `Now send the reply message you want the bot to send whenever someone sends *${trigger}* in a private chat.\n\n` +
+            `_Send the reply as your next message. Type \`cancel\` to abort._`;
+
+        const sent = await sock.sendMessage(from, { text: prompt }, { quoted: msg });
+        if (sent && sent.key) {
+            sessionManager.addPendingMessage(sender, from, sent.key.id, this.name);
+        }
+        await react('✍️');
+    },
+
+    async handleSession(sock, msg, session, context) {
+        const { from, sender, reply, isButtonClick } = context;
+
+        // Ignore button clicks — this command uses plain messages only.
+        if (isButtonClick) return true;
+
+        const text = extractPlainText(msg);
+        if (!text) {
+            await reply('⚠️ Please send the reply as a text message.');
+            return true;
+        }
+
+        if (/^(cancel|stop|exit|quit)$/i.test(text)) {
+            sessionManager.clearSession(session.id);
+            await reply('❌ AutoReply setup cancelled.');
+            return true;
+        }
+
+        const trigger = session.data?.trigger;
+        if (!trigger) {
+            sessionManager.clearSession(session.id);
+            await reply('❌ Session error: missing trigger. Please try again.');
+            return true;
+        }
+
+        autoreplyRules.set(trigger, { text });
+        const ok = await saveRules();
+        sessionManager.clearSession(session.id);
+
+        const preview = text.length > 200 ? text.slice(0, 200) + '…' : text;
+        await reply(
+            `✅ *AutoReply Saved*\n\n` +
+            `Trigger: \`${trigger}\`\n` +
+            `Reply:\n${preview}\n\n` +
+            (ok ? `💾 Saved to Google Drive.` : `⚠️ Saved in memory but failed to sync to Drive.`)
+        );
+        return true;
     }
 };
 
-// ==================== EXPORT FOR HANDLER INTEGRATION ====================
+// ==================== EXPORTS FOR HANDLER ====================
 
-// Initialize on module load
 loadRules().catch(console.error);
-
-// Function to check and reply to messages (to be called from handler)
-async function checkAutoReply(sock, from, sender, message, reply) {
-    // Only process in private chats
-    if (from.endsWith('@g.us')) return false;
-    if (from.includes('@broadcast')) return false;
-    if (from.includes('@newsletter')) return false;
-    
-    return await checkAndReply(sock, from, sender, message, reply);
-}
-
-// Function to handle button clicks from auto-reply messages
-async function handleAutoReplyButton(sock, msg, buttonId, buttonText, from, sender, reply) {
-    return await handleButtonClick(sock, msg, buttonId, buttonText, from, sender, reply);
-}
 
 module.exports.checkAutoReply = checkAutoReply;
 module.exports.handleAutoReplyButton = handleAutoReplyButton;
