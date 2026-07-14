@@ -109,22 +109,47 @@ async function isLoggedIn(driver) {
 }
 
 // ----------- login steps -----------
+function normalizePkPhone(input) {
+    let d = (input || '').replace(/\D/g, '');
+    if (d.startsWith('0092')) d = d.slice(4);
+    if (d.startsWith('92')) d = d.slice(2);
+    if (d.startsWith('0')) d = d.slice(1);
+    // d should now be 10 digits starting with 3 (e.g. 3247220362)
+    return '0' + d; // 11 digits: 03XXXXXXXXX
+}
+
 async function submitPhone(driver, phone) {
     await driver.get(LOGIN_URL);
-    await driver.sleep(2500);
-    const phoneInput = await driver.wait(until.elementLocated(By.id('msisdn')), 20000);
+    await driver.sleep(3000);
+    const local = normalizePkPhone(phone);
+    if (!/^03\d{9}$/.test(local)) {
+        throw new Error(`Invalid Pakistan mobile number after normalization: ${local}`);
+    }
+    // JazzDrive page has TWO forms: #signinform (Sign Up, #msisdn) and
+    // #signinform2 (Login, #msisdn2). We MUST use the login form.
+    const phoneInput = await driver.wait(until.elementLocated(By.id('msisdn2')), 20000);
     await phoneInput.clear();
-    await phoneInput.sendKeys(phone);
-    const btn = await driver.wait(until.elementLocated(By.id('signinbtn')), 20000);
-    await driver.wait(until.elementIsEnabled(btn), 10000);
-    await btn.click();
-    await driver.sleep(3500);
+    await phoneInput.sendKeys(local);
+    // Click the Login button (scoped inside #signinform2 to avoid the Subscribe btn)
+    const loginBtn = await driver.wait(
+        until.elementLocated(By.css('#signinform2 #signinbtn, #signinform2 button')),
+        20000
+    );
+    await driver.wait(until.elementIsEnabled(loginBtn), 10000);
+    try { await loginBtn.click(); } catch (_) {
+        await driver.executeScript('arguments[0].click();', loginBtn);
+    }
+    await driver.sleep(5000);
     // On success the page moves to the OTP entry view
     const url = (await driver.getCurrentUrl()).toLowerCase();
     const otpProbe = await driver.findElements(
         By.xpath("//input[@type='tel' or @type='text' or @type='number']")
     );
-    return otpProbe.length > 0 || url.includes('otp') || url.includes('verify');
+    // On the initial login page the two visible inputs are #msisdn and #msisdn2.
+    // OTP screen has different inputs (short maxlength or a single otp field), and
+    // #msisdn2 is no longer present.
+    const stillOnLogin = await driver.findElements(By.id('msisdn2'));
+    return stillOnLogin.length === 0 || url.includes('otp') || url.includes('verify') || url.includes('pin');
 }
 
 async function submitOtp(driver, otp) {
