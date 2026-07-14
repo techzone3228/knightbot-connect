@@ -69,9 +69,10 @@ export async function botFetch<T = unknown>(
   const text = await res.text();
   const data = text ? safeJson(text) : null;
   if (!res.ok) {
-    const msg =
-      (data && typeof data === "object" && "error" in data && String((data as { error: unknown }).error)) ||
-      `Request failed (${res.status})`;
+    let msg = `Request failed (${res.status})`;
+    if (data && typeof data === "object" && "error" in data) {
+      msg = String((data as { error: unknown }).error);
+    }
     throw new Error(msg);
   }
   return data as T;
